@@ -8,121 +8,143 @@ const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] }
 });
 
-app.get('/', (req, res) => res.send('JET BATTLE Server Running ✈️'));
+app.get('/', (req, res) => res.send('JET BATTLE Server ✈️ Running'));
 
-// rooms: { roomCode: { players: [socket1, socket2], state: {} } }
+// rooms: code → { players: [socketId1, socketId2], started: bool }
 const rooms = {};
 
+// waiting players: socketId → { id, name, flag, status: 'waiting'|'in-game' }
+const waitingPlayers = {};
+
 function generateCode() {
-  return Math.floor(1000 + Math.random() * 9000).toString();
+  let code;
+  do { code = Math.floor(1000 + Math.random() * 9000).toString(); } while (rooms[code]);
+  return code;
+}
+
+function broadcastWaitingList() {
+  const list = Object.values(waitingPlayers);
+  io.emit('waiting_players', list);
 }
 
 io.on('connection', (socket) => {
-  console.log('Connected:', socket.id);
+  console.log('+ Connect:', socket.id);
 
-  // Player 1 creates a room
-  socket.on('create_room', ({ country }) => {
-    let code;
-    do { code = generateCode(); } while (rooms[code]);
+  // ── Enter the waiting room ──────────────────────────────
+  socket.on('enter_waiting', ({ country }) => {
+    // Generate a private room code for this player
+    const code = generateCode();
+    rooms[code] = { players: [socket.id], started: false, private: true };
+    socket.roomCode = code;
+    socket.country = country;
 
-    rooms[code] = {
-      code,
-      players: [{ id: socket.id, country, playerNum: 1 }],
-      gameStarted: false
+    // Add to waiting list
+    waitingPlayers[socket.id] = {
+      id: socket.id,
+      name: country.name,
+      flag: country.flag,
+      status: 'waiting',
+      roomCode: code
     };
 
-    socket.join(code);
-    socket.roomCode = code;
-    socket.playerNum = 1;
-
-    socket.emit('room_created', { code, playerNum: 1 });
-    console.log(`Room ${code} created by ${socket.id}`);
+    socket.emit('your_room_code', { code });
+    broadcastWaitingList();
   });
 
-  // Player 2 joins a room
+  // ── Join via private code ───────────────────────────────
   socket.on('join_room', ({ code, country }) => {
     const room = rooms[code];
+    if (!room)               return socket.emit('error', { msg: 'Room not found! Check the code.' });
+    if (room.players.length >= 2) return socket.emit('error', { msg: 'Room is full!' });
+    if (room.started)        return socket.emit('error', { msg: 'Game already started!' });
 
-    if (!room) {
-      socket.emit('error', { msg: 'Room not found! Check the code.' });
-      return;
-    }
-    if (room.players.length >= 2) {
-      socket.emit('error', { msg: 'Room is full! Game already in progress.' });
-      return;
-    }
-    if (room.gameStarted) {
-      socket.emit('error', { msg: 'Game already started!' });
-      return;
-    }
+    const p1Id = room.players[0];
+    const p1Sock = io.sockets.sockets.get(p1Id);
+    if (!p1Sock) return socket.emit('error', { msg: 'Host disconnected.' });
 
-    room.players.push({ id: socket.id, country, playerNum: 2 });
-    socket.join(code);
+    room.players.push(socket.id);
+    room.started = true;
     socket.roomCode = code;
-    socket.playerNum = 2;
+    socket.country = country;
 
-    // Tell P2 their number
-    socket.emit('room_joined', { code, playerNum: 2 });
+    // Mark both as in-game
+    if (waitingPlayers[p1Id])   waitingPlayers[p1Id].status = 'in-game';
+    if (waitingPlayers[socket.id]) waitingPlayers[socket.id].status = 'in-game';
 
-    // Tell both players to start — send each other's country
-    const p1Country = room.players[0].country;
-    const p2Country = room.players[1].country;
+    const p1C = p1Sock.country;
+    const p2C = country;
 
-    io.to(room.players[0].id).emit('game_start', {
-      myCountry: p1Country,
-      enemyCountry: p2Country,
-      playerNum: 1
+    io.to(p1Id).emit('game_start', { myCountry: p1C, enemyCountry: p2C, playerNum: 1 });
+    socket.emit('game_start', { myCountry: p2C, enemyCountry: p1C, playerNum: 2 });
+
+    broadcastWaitingList();
+    console.log(`Room ${code} started: ${p1C.name} vs ${p2C.name}`);
+  });
+
+  // ── Challenge a waiting player ──────────────────────────
+  socket.on('challenge', ({ targetId, myName, myFlag }) => {
+    const targetSocket = io.sockets.sockets.get(targetId);
+    if (!targetSocket) return socket.emit('error', { msg: 'Player no longer available.' });
+    targetSocket.emit('challenge_received', {
+      fromId: socket.id,
+      fromName: myName,
+      fromFlag: myFlag
     });
-    io.to(room.players[1].id).emit('game_start', {
-      myCountry: p2Country,
-      enemyCountry: p1Country,
-      playerNum: 2
-    });
-
-    room.gameStarted = true;
-    console.log(`Room ${code} game started!`);
+    socket.pendingChallengeTo = targetId;
   });
 
-  // Relay player state (position, bullets, hp) to opponent
-  socket.on('player_state', (data) => {
-    const code = socket.roomCode;
-    if (!code || !rooms[code]) return;
-    // Send to everyone else in the room
-    socket.to(code).emit('opponent_state', data);
+  socket.on('accept_challenge', ({ fromId }) => {
+    const fromSocket = io.sockets.sockets.get(fromId);
+    if (!fromSocket) return;
+
+    // Use the challenger's room code
+    const code = fromSocket.roomCode;
+    const room = rooms[code];
+    if (!room || room.players.length >= 2 || room.started) {
+      socket.emit('error', { msg: 'Room no longer available.' });
+      return;
+    }
+
+    room.players.push(socket.id);
+    room.started = true;
+    socket.roomCode = code;
+
+    const p1C = fromSocket.country;
+    const p2C = socket.country;
+
+    if (waitingPlayers[fromId])    waitingPlayers[fromId].status = 'in-game';
+    if (waitingPlayers[socket.id]) waitingPlayers[socket.id].status = 'in-game';
+
+    io.to(fromId).emit('game_start', { myCountry: p1C, enemyCountry: p2C, playerNum: 1 });
+    socket.emit('game_start', { myCountry: p2C, enemyCountry: p1C, playerNum: 2 });
+
+    broadcastWaitingList();
+    console.log(`Challenge accepted: ${p1C.name} vs ${p2C.name}`);
   });
 
-  // Relay shoot event
-  socket.on('shoot', (data) => {
-    const code = socket.roomCode;
-    if (!code || !rooms[code]) return;
-    socket.to(code).emit('opponent_shoot', data);
+  socket.on('decline_challenge', ({ fromId }) => {
+    const fromSocket = io.sockets.sockets.get(fromId);
+    if (fromSocket) fromSocket.emit('challenge_declined');
   });
 
-  // Relay hit/damage
-  socket.on('hit', (data) => {
-    const code = socket.roomCode;
-    if (!code || !rooms[code]) return;
-    socket.to(code).emit('opponent_hit', data);
-  });
+  // ── Game relay ──────────────────────────────────────────
+  socket.on('player_state', (data) => socket.to(socket.roomCode).emit('opponent_state', data));
+  socket.on('shoot',        (data) => socket.to(socket.roomCode).emit('opponent_shoot', data));
+  socket.on('hit',          (data) => socket.to(socket.roomCode).emit('opponent_hit', data));
+  socket.on('game_over',    (data) => socket.to(socket.roomCode).emit('game_over', data));
 
-  // Game over
-  socket.on('game_over', (data) => {
-    const code = socket.roomCode;
-    if (!code || !rooms[code]) return;
-    io.to(code).emit('game_over', data);
-  });
-
-  // Disconnect
+  // ── Disconnect ──────────────────────────────────────────
   socket.on('disconnect', () => {
     const code = socket.roomCode;
     if (code && rooms[code]) {
       socket.to(code).emit('opponent_disconnected');
       delete rooms[code];
-      console.log(`Room ${code} closed (disconnect)`);
     }
-    console.log('Disconnected:', socket.id);
+    delete waitingPlayers[socket.id];
+    broadcastWaitingList();
+    console.log('- Disconnect:', socket.id);
   });
 });
 
 const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => console.log(`JET BATTLE server on port ${PORT}`));
+server.listen(PORT, () => console.log(`JET BATTLE server on :${PORT}`));
