@@ -10,7 +10,7 @@ const io = new Server(server, {
 
 app.get('/', (req, res) => res.send('JET BATTLE Server ✈️ Running'));
 
-// rooms: code → { players: [socketId1, socketId2], started: bool }
+// rooms: code → { players, started, match: { hpById, over } }
 const rooms = {};
 
 // waiting players: socketId → { id, name, flag, status: 'waiting'|'in-game' }
@@ -65,6 +65,10 @@ io.on('connection', (socket) => {
 
     room.players.push(socket.id);
     room.started = true;
+    room.match = {
+      hpById: { [p1Id]: 100, [socket.id]: 100 },
+      over: false
+    };
     socket.roomCode = code;
     socket.country = country;
     socket.join(code);
@@ -109,6 +113,10 @@ io.on('connection', (socket) => {
 
     room.players.push(socket.id);
     room.started = true;
+    room.match = {
+      hpById: { [fromId]: 100, [socket.id]: 100 },
+      over: false
+    };
     socket.roomCode = code;
     socket.join(code);
 
@@ -131,10 +139,71 @@ io.on('connection', (socket) => {
   });
 
   // ── Game relay ──────────────────────────────────────────
-  socket.on('player_state', (data) => socket.to(socket.roomCode).emit('opponent_state', data));
-  socket.on('shoot',        (data) => socket.to(socket.roomCode).emit('opponent_shoot', data));
-  socket.on('hit',          (data) => socket.to(socket.roomCode).emit('opponent_hit', data));
-  socket.on('game_over',    (data) => socket.to(socket.roomCode).emit('game_over', data));
+  socket.on('player_state', (data) => {
+    const room = rooms[socket.roomCode];
+    if (!room || !room.started || (room.match && room.match.over)) return;
+    socket.to(socket.roomCode).emit('opponent_state', data);
+  });
+
+  socket.on('shoot', (data) => {
+    const room = rooms[socket.roomCode];
+    if (!room || !room.started || (room.match && room.match.over)) return;
+    socket.to(socket.roomCode).emit('opponent_shoot', data);
+  });
+
+  socket.on('hit', (data) => {
+    const roomCode = socket.roomCode;
+    const room = rooms[roomCode];
+    if (!room || !room.started || !room.players || room.players.length < 2) return;
+
+    if (!room.match) {
+      room.match = {
+        hpById: { [room.players[0]]: 100, [room.players[1]]: 100 },
+        over: false
+      };
+    }
+    if (room.match.over) return;
+
+    const [p1Id, p2Id] = room.players;
+    const defenderId = socket.id === p1Id ? p2Id : socket.id === p2Id ? p1Id : null;
+    if (!defenderId) return;
+
+    const raw = Number(data && data.damage);
+    const damage = Number.isFinite(raw) ? Math.max(0, Math.min(40, Math.floor(raw))) : 0;
+    if (damage <= 0) return;
+
+    const currentHp = room.match.hpById[defenderId] ?? 100;
+    const nextHp = Math.max(0, currentHp - damage);
+    room.match.hpById[defenderId] = nextHp;
+
+    socket.to(roomCode).emit('opponent_hit', { damage });
+
+    if (nextHp === 0) {
+      room.match.over = true;
+      const winner = socket.id === p1Id ? 1 : 2;
+      io.to(roomCode).emit('game_over', { winner });
+    }
+  });
+
+  socket.on('game_over', (data) => {
+    const roomCode = socket.roomCode;
+    const room = rooms[roomCode];
+    if (!room || !room.started || !room.players || room.players.length < 2) return;
+
+    if (!room.match) {
+      room.match = {
+        hpById: { [room.players[0]]: 100, [room.players[1]]: 100 },
+        over: false
+      };
+    }
+    if (room.match.over) return;
+
+    const winner = data && (data.winner === 1 || data.winner === 2) ? data.winner : null;
+    if (!winner) return;
+
+    room.match.over = true;
+    io.to(roomCode).emit('game_over', { winner });
+  });
 
   // ── Disconnect ──────────────────────────────────────────
   socket.on('disconnect', () => {
