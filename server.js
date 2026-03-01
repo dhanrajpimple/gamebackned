@@ -37,6 +37,7 @@ io.on('connection', (socket) => {
     rooms[code] = { players: [socket.id], started: false, private: true };
     socket.roomCode = code;
     socket.country = country;
+    socket.join(code);
 
     // Add to waiting list
     waitingPlayers[socket.id] = {
@@ -66,6 +67,7 @@ io.on('connection', (socket) => {
     room.started = true;
     socket.roomCode = code;
     socket.country = country;
+    socket.join(code);
 
     // Mark both as in-game
     if (waitingPlayers[p1Id])   waitingPlayers[p1Id].status = 'in-game';
@@ -108,6 +110,7 @@ io.on('connection', (socket) => {
     room.players.push(socket.id);
     room.started = true;
     socket.roomCode = code;
+    socket.join(code);
 
     const p1C = fromSocket.country;
     const p2C = socket.country;
